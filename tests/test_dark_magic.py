@@ -6,6 +6,8 @@ from __future__ import absolute_import, division, print_function
 
 import pickle
 
+from copy import copy, deepcopy
+
 import pytest
 import six
 
@@ -104,6 +106,36 @@ class WithMetaSlots(object):
 
 
 FromMakeClass = attr.make_class("FromMakeClass", ["x"])
+
+
+@attr.s(auto_exc=True)
+class PickedError(Exception):
+    """
+    A module-level auto_exc exception so it can be pickled in tests.
+    """
+
+    x = attr.ib()
+    y = attr.ib(init=False, default=42)
+
+
+@attr.s(auto_exc=True, slots=True)
+class PickedErrorSlots(Exception):
+    """
+    Same as `PickedError` but with slots.
+    """
+
+    x = attr.ib()
+    y = attr.ib(init=False, default=42)
+
+
+@attr.s(auto_exc=True, slots=True, frozen=True)
+class PickedErrorFrozenSlots(Exception):
+    """
+    Same as `PickedError` but frozen and with slots.
+    """
+
+    x = attr.ib()
+    y = attr.ib(init=False, default=42)
 
 
 class TestDarkMagic(object):
@@ -508,3 +540,240 @@ class TestDarkMagic(object):
         assert "property" == attr.fields(C).property.name
         assert "itemgetter" == attr.fields(C).itemgetter.name
         assert "x" == attr.fields(C).x.name
+
+    @pytest.mark.parametrize("slots", [True, False])
+    @pytest.mark.parametrize("frozen", [True, False])
+    def test_auto_exc(self, slots, frozen):
+        """
+        Classes with auto_exc=True have a Exception-style __str__, are neither
+        comparable nor hashable, and store the fields additionally in
+        self.args.
+        """
+
+        @attr.s(auto_exc=True, slots=slots, frozen=frozen)
+        class FooError(Exception):
+            x = attr.ib()
+            y = attr.ib(init=False, default=42)
+            z = attr.ib(init=False)
+            a = attr.ib()
+
+        FooErrorMade = attr.make_class(
+            "FooErrorMade",
+            bases=(Exception,),
+            attrs={
+                "x": attr.ib(),
+                "y": attr.ib(init=False, default=42),
+                "z": attr.ib(init=False),
+                "a": attr.ib(),
+            },
+            auto_exc=True,
+            slots=slots,
+            frozen=frozen,
+        )
+
+        assert FooError(1, "foo") != FooError(1, "foo")
+        assert FooErrorMade(1, "foo") != FooErrorMade(1, "foo")
+
+        for cls in (FooError, FooErrorMade):
+            with pytest.raises(cls) as ei:
+                raise cls(1, "foo")
+
+            e = ei.value
+
+            assert e is e
+            assert e == e
+            assert "(1, 'foo')" == str(e)
+            assert (1, "foo") == e.args
+
+            with pytest.raises(TypeError):
+                hash(e)
+
+            if not frozen:
+                deepcopy(e)
+
+    @pytest.mark.parametrize("slots", [True, False])
+    @pytest.mark.parametrize("frozen", [True, False])
+    def test_auto_exc_one_attrib(self, slots, frozen):
+        """
+        Having one attribute works with auto_exc=True.
+
+        Easy to get wrong with tuple literals.
+        """
+
+        @attr.s(auto_exc=True, slots=slots, frozen=frozen)
+        class FooError(Exception):
+            x = attr.ib()
+
+        FooError(1)
+
+    @pytest.mark.parametrize("slots", [True, False])
+    @pytest.mark.parametrize("frozen", [True, False])
+    def test_auto_exc_repr(self, slots, frozen):
+        """
+        auto_exc exceptions get the attrs-generated repr.
+        """
+
+        @attr.s(auto_exc=True, slots=slots, frozen=frozen)
+        class FooError(Exception):
+            x = attr.ib()
+            y = attr.ib(init=False, default=42)
+
+        assert "FooError(x=1, y=42)" == repr(FooError(1))
+
+    @pytest.mark.parametrize("slots", [True, False])
+    @pytest.mark.parametrize("frozen", [True, False])
+    def test_auto_exc_copy(self, slots, frozen):
+        """
+        copy.copy and copy.deepcopy preserve fields and args of auto_exc
+        exceptions.
+        """
+
+        @attr.s(auto_exc=True, slots=slots, frozen=frozen)
+        class FooError(Exception):
+            x = attr.ib()
+            y = attr.ib(init=False, default=42)
+
+        e = FooError(1)
+
+        # Frozen exceptions with a __dict__ can't be copied because
+        # restoring their state goes through __setattr__.
+        if not frozen or slots:
+            for c in (copy(e), deepcopy(e)):
+                assert 1 == c.x
+                assert 42 == c.y
+                assert (1,) == c.args
+                assert "1" == str(c)
+
+    @pytest.mark.parametrize(
+        "cls", [PickedError, PickedErrorSlots, PickedErrorFrozenSlots]
+    )
+    def test_auto_exc_pickling(self, cls):
+        """
+        auto_exc exceptions survive a pickle round-trip with their fields
+        and args intact.
+        """
+        e = cls(1)
+
+        for protocol in range(pickle.HIGHEST_PROTOCOL + 1):
+            p = pickle.loads(pickle.dumps(e, protocol))
+
+            assert 1 == p.x
+            assert 42 == p.y
+            assert (1,) == p.args
+            assert "1" == str(p)
+
+    @pytest.mark.parametrize("slots", [True, False])
+    def test_auto_exc_chain(self, slots):
+        """
+        Exception chaining works with auto_exc exceptions and keeps args
+        intact.
+        """
+
+        @attr.s(auto_exc=True, slots=slots)
+        class FooError(Exception):
+            x = attr.ib()
+
+        with pytest.raises(FooError) as ei:
+            try:
+                raise ValueError("original")
+            except ValueError as e:
+                raise FooError(1) from e
+
+        assert isinstance(ei.value.__cause__, ValueError)
+        assert isinstance(ei.value.__context__, ValueError)
+        assert (1,) == ei.value.args
+
+    @pytest.mark.parametrize("slots", [True, False])
+    def test_auto_exc_inheritance(self, slots):
+        """
+        Fields are collected over the whole exception hierarchy and all of
+        them end up in args.
+        """
+
+        @attr.s(auto_exc=True, slots=slots)
+        class BaseError(Exception):
+            x = attr.ib()
+
+        @attr.s(auto_exc=True, slots=slots)
+        class MidError(BaseError):
+            pass
+
+        @attr.s(auto_exc=True, slots=slots)
+        class SubError(MidError):
+            y = attr.ib()
+
+        e = SubError(1, 2)
+
+        assert 1 == e.x
+        assert 2 == e.y
+        assert (1, 2) == e.args
+        assert "SubError(x=1, y=2)" == repr(e)
+
+        with pytest.raises(BaseError):
+            raise e
+
+    @pytest.mark.parametrize("slots", [True, False])
+    def test_auto_exc_kw_only(self, slots):
+        """
+        Keyword-only fields are included in args.
+        """
+
+        @attr.s(auto_exc=True, slots=slots)
+        class FooError(Exception):
+            x = attr.ib()
+            y = attr.ib(kw_only=True)
+
+        e = FooError(1, y=2)
+
+        assert 2 == e.y
+        assert (1, 2) == e.args
+
+    @pytest.mark.parametrize("slots", [True, False])
+    def test_auto_exc_defaults(self, slots):
+        """
+        Fields with defaults end up in args with their resolved values --
+        factories are not leaked into args.
+        """
+
+        @attr.s(auto_exc=True, slots=slots)
+        class FooError(Exception):
+            x = attr.ib()
+            y = attr.ib(default=42)
+            z = attr.ib(factory=list)
+
+        assert (1, 42, []) == FooError(1).args
+        assert (1, 2, [3]) == FooError(1, 2, [3]).args
+
+    def test_auto_exc_respects_user_init(self):
+        """
+        With init=False, a user-defined __init__ is left untouched on
+        auto_exc classes.
+        """
+
+        @attr.s(auto_exc=True, init=False)
+        class FooError(Exception):
+            x = attr.ib()
+
+            def __init__(self, x):
+                self.x = x
+                Exception.__init__(self, x)
+
+        e = FooError(1)
+
+        assert 1 == e.x
+        assert (1,) == e.args
+
+    def test_auto_exc_respects_user_eq(self):
+        """
+        auto_exc doesn't add comparison methods but leaves user-defined
+        ones alone.
+        """
+
+        @attr.s(auto_exc=True)
+        class FooError(Exception):
+            x = attr.ib()
+
+            def __eq__(self, other):
+                return True
+
+        assert FooError(1) == FooError(2)
