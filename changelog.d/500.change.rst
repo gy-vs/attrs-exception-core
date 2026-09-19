@@ -1,0 +1,12 @@
+``attrs`` now has first class support for defining exception classes via the new ``auto_exc`` argument of :func:`attr.s`.
+
+Classes created with ``@attr.s(auto_exc=True)`` that subclass :class:`BaseException` behave like well-behaved Python exceptions:
+
+- the fields are initialized exactly like with regular ``attrs`` classes (including defaults, factories, keyword-only fields, slots, frozen and multi-level inheritance),
+- only the actual positional construction parameters end up in ``args`` -- keyword-only fields, ``init=False`` fields and unused factory defaults are excluded,
+- ``__str__`` and ``__repr__`` match those of native exceptions,
+- the instances compare and hash by identity,
+- raising, catching, exception chaining, ``copy.copy``/``copy.deepcopy`` and pickling (including required keyword-only fields and all pickle protocols) work as expected.
+
+A :class:`ValueError` is raised when a class with ``auto_exc=True`` defines its own ``__init__`` (use ``init=False`` to keep it) or an attribute named ``args``.
+`#500 <https://github.com/python-attrs/attrs/issues/500>`_

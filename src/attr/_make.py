@@ -9,6 +9,14 @@ import warnings
 
 from operator import itemgetter
 
+try:
+    # Python 3.
+    from copyreg import __newobj_ex__ as _newobj_ex
+except ImportError:  # pragma: no cover
+    # Python 2 has no __newobj_ex__; auto_exc classes with keyword-only
+    # attributes cannot occur there and exceptions reconstruct natively.
+    _newobj_ex = None
+
 from . import _config
 from ._compat import (
     PY2,
@@ -453,6 +461,7 @@ class _ClassBuilder(object):
         "_has_post_init",
         "_delete_attribs",
         "_base_attr_map",
+        "_is_exc",
     )
 
     def __init__(
@@ -465,6 +474,7 @@ class _ClassBuilder(object):
         auto_attribs,
         kw_only,
         cache_hash,
+        is_exc,
     ):
         attrs, base_attrs, base_map = _transform_attrs(
             cls, these, auto_attribs, kw_only
@@ -482,6 +492,13 @@ class _ClassBuilder(object):
         self._cache_hash = cache_hash
         self._has_post_init = bool(getattr(cls, "__attrs_post_init__", False))
         self._delete_attribs = not bool(these)
+        self._is_exc = is_exc
+
+        if is_exc and any(a.name == "args" for a in self._attrs):
+            raise ValueError(
+                "Can't have an attribute named 'args' on exception class "
+                "{cls!r}.".format(cls=cls)
+            )
 
         self._cls_dict["__attrs_attrs__"] = self._attrs
 
@@ -618,9 +635,12 @@ class _ClassBuilder(object):
             if hash_caching_enabled:
                 __bound_setattr(_hash_cache_field, None)
 
-        # slots and frozen require __getstate__/__setstate__ to work
-        cd["__getstate__"] = slots_getstate
-        cd["__setstate__"] = slots_setstate
+        # slots and frozen require __getstate__/__setstate__ to work.
+        # Exception classes bring their own __setstate__ that also restores
+        # ``args``; keep it instead of overwriting it.
+        if not self._is_exc:
+            cd["__getstate__"] = slots_getstate
+            cd["__setstate__"] = slots_setstate
 
         # Create new class based on old class and our methods.
         cls = type(self._cls)(self._cls.__name__, self._cls.__bases__, cd)
@@ -651,6 +671,25 @@ class _ClassBuilder(object):
         self._cls_dict["__repr__"] = self._add_method_dunders(
             _make_repr(self._attrs, ns=ns)
         )
+        return self
+
+    def add_exc_repr(self):
+        """
+        Add a ``__repr__`` that mimics CPython's native exception repr,
+        i.e. ``ClassName(self.args)``.
+        """
+        self._cls_dict["__repr__"] = self._add_method_dunders(_exc_repr)
+        return self
+
+    def add_exc_pickle(self):
+        """
+        Add ``__reduce__`` and ``__setstate__`` that make exception
+        instances picklable and copyable even when they have keyword-only
+        attributes.
+        """
+        exc_reduce, exc_setstate = _make_exc_pickle_methods(self._attrs)
+        self._cls_dict["__reduce__"] = self._add_method_dunders(exc_reduce)
+        self._cls_dict["__setstate__"] = self._add_method_dunders(exc_setstate)
         return self
 
     def add_str(self):
@@ -688,6 +727,7 @@ class _ClassBuilder(object):
                 self._slots,
                 self._cache_hash,
                 self._base_attr_map,
+                self._is_exc,
             )
         )
 
@@ -738,6 +778,7 @@ def attrs(
     auto_attribs=False,
     kw_only=False,
     cache_hash=False,
+    auto_exc=False,
 ):
     r"""
     A class decorator that adds `dunder
@@ -847,6 +888,27 @@ def attrs(
         fields involved in hash code computation or mutations of the objects
         those fields point to after object creation.  If such changes occur,
         the behavior of the object's hash code is undefined.
+    :param bool auto_exc: If the class subclasses :class:`BaseException`
+        (which implicitly includes any subclass of any exception), the
+        following happens to behave like a well-behaved Python exceptions
+        class:
+
+        - the values for *cmp* and *hash* are ignored and the instances
+          compare and hash by the instance's ids (N.B. ``attrs`` will *not*
+          remove existing implementations of ``__hash__`` or the equality
+          methods.  It just won't add its own ones),
+
+        - all attributes that are either passed into ``__init__`` or that
+          have a static default value are additionally available in the
+          tuple in the ``args`` attribute.  Keyword-only attributes,
+          ``init=False`` attributes and factory-produced defaults that were
+          not passed are *not* added,
+
+        - the value of *str* is ignored leaving ``__str__`` to the exception
+          base classes.
+
+        ``attrs`` raises a :class:`ValueError` if the class defines its own
+        ``__init__`` method or an attribute named ``args``.
 
     .. versionadded:: 16.0.0 *slots*
     .. versionadded:: 16.1.0 *frozen*
@@ -866,11 +928,34 @@ def attrs(
        to each other.
     .. versionadded:: 18.2.0 *kw_only*
     .. versionadded:: 18.2.0 *cache_hash*
+    .. versionadded:: 19.1.0 *auto_exc*
     """
 
     def wrap(cls):
         if getattr(cls, "__class__", None) is None:
             raise TypeError("attrs only works with new-style classes.")
+
+        is_exc = auto_exc is True and issubclass(cls, BaseException)
+
+        if is_exc:
+            if (
+                init is not False
+                and "__init__" in cls.__dict__
+                and cls.__dict__["__init__"] is not object.__init__
+            ):
+                raise ValueError(
+                    "Can't add __init__ to exception class {cls!r} that "
+                    "already defines one.  Set init=False if you want to "
+                    "keep it.".format(cls=cls)
+                )
+            args_attr = any(
+                a.name == "args" for a in getattr(cls, "__attrs_attrs__", ())
+            )
+            if args_attr:
+                raise ValueError(
+                    "Can't add an attribute named 'args' to exception "
+                    "class {cls!r}.".format(cls=cls)
+                )
 
         builder = _ClassBuilder(
             cls,
@@ -881,14 +966,22 @@ def attrs(
             auto_attribs,
             kw_only,
             cache_hash,
+            is_exc,
         )
 
         if repr is True:
-            builder.add_repr(repr_ns)
-        if str is True:
+            if is_exc:
+                builder.add_exc_repr()
+            else:
+                builder.add_repr(repr_ns)
+        # Exceptions keep their native __str__ (based on args).
+        if str is True and not is_exc:
             builder.add_str()
-        if cmp is True:
+        if cmp is True and not is_exc:
             builder.add_cmp()
+
+        if is_exc:
+            builder.add_exc_pickle()
 
         if hash is not True and hash is not False and hash is not None:
             # Can't use `hash in` because 1 == True for example.
@@ -902,8 +995,19 @@ def attrs(
                     " hashing must be either explicitly or implicitly "
                     "enabled."
                 )
-        elif hash is True or (hash is None and cmp is True and frozen is True):
+        elif (
+            hash is True
+            or (hash is None and cmp is True and frozen is True)
+        ) and is_exc is False:
             builder.add_hash()
+        elif is_exc:
+            # Leave BaseException's id-based __hash__ and __eq__ alone.
+            if cache_hash:
+                raise TypeError(
+                    "Invalid value for cache_hash.  To use hash caching,"
+                    " hashing must be either explicitly or implicitly "
+                    "enabled."
+                )
         else:
             if cache_hash:
                 raise TypeError(
@@ -1241,7 +1345,76 @@ def _add_repr(cls, ns=None, attrs=None):
     return cls
 
 
-def _make_init(attrs, post_init, frozen, slots, cache_hash, base_attr_map):
+def _exc_repr(self):
+    """
+    Reproduce CPython's native exception repr which is based on
+    ``self.args`` rather than the instance attributes.
+    """
+    return "{0}({1})".format(
+        self.__class__.__name__,
+        ", ".join(repr(v) for v in self.args),
+    )
+
+
+def _make_exc_pickle_methods(attrs):
+    """
+    Create ``__reduce__`` and ``__setstate__`` methods for an
+    ``auto_exc=True`` class.
+
+    Native exception pickling hands ``self.args`` back to ``__init__`` which
+    fails as soon as an attribute is keyword-only.  Therefore the generated
+    methods create the instance without invoking ``__init__`` (through
+    ``copyreg.__newobj_ex__``) and round-trip both the stored attributes and
+    the original ``args`` tuple.
+    """
+    state_attr_names = tuple(a.name for a in attrs)
+
+    def exc_reduce(self):
+        """
+        Automatically created by attrs.
+        """
+        # Only include attributes that have actually been set.  init=False
+        # fields without a default never get assigned (and may just be an
+        # uninitialized slot); using a mapping also makes the state robust
+        # against new fields appearing in subclasses.
+        state = dict(
+            (name, getattr(self, name))
+            for name in state_attr_names
+            if hasattr(self, name)
+        )
+        # Also round-trip additional (non-attrs) instance attributes, e.g.
+        # ones created in __attrs_post_init__, mirroring what CPython does
+        # for regular exception __dict__s.  Skip anything that lives in a
+        # slot rather than the instance dict.
+        extra = getattr(self, "__dict__", None)
+        if extra:
+            for name, value in extra.items():
+                if name not in state:
+                    state[name] = value
+        return (
+            _newobj_ex,
+            (self.__class__, (), {}),
+            # The original args are always restored explicitly, so __str__
+            # and native exception semantics survive the round-trip even
+            # when the stored fields diverge from them.
+            {"__attrs_args__": self.args, "__attrs_state__": state},
+        )
+
+    def exc_setstate(self, state):
+        """
+        Automatically created by attrs.
+        """
+        __bound_setattr = _obj_setattr.__get__(self, self.__class__)
+        for name, value in state["__attrs_state__"].items():
+            __bound_setattr(name, value)
+        BaseException.__init__(self, *state["__attrs_args__"])
+
+    return exc_reduce, exc_setstate
+
+
+def _make_init(
+    attrs, post_init, frozen, slots, cache_hash, base_attr_map, is_exc
+):
     attrs = [a for a in attrs if a.init or a.default is not NOTHING]
 
     # We cache the generated init methods for the same kinds of attributes.
@@ -1250,7 +1423,7 @@ def _make_init(attrs, post_init, frozen, slots, cache_hash, base_attr_map):
     unique_filename = "<attrs generated init {0}>".format(sha1.hexdigest())
 
     script, globs, annotations = _attrs_to_init_script(
-        attrs, frozen, slots, post_init, cache_hash, base_attr_map
+        attrs, frozen, slots, post_init, cache_hash, base_attr_map, is_exc
     )
     locs = {}
     bytecode = compile(script, unique_filename, "exec")
@@ -1274,21 +1447,6 @@ def _make_init(attrs, post_init, frozen, slots, cache_hash, base_attr_map):
     __init__ = locs["__init__"]
     __init__.__annotations__ = annotations
     return __init__
-
-
-def _add_init(cls, frozen):
-    """
-    Add a __init__ method to *cls*.  If *frozen* is True, make it immutable.
-    """
-    cls.__init__ = _make_init(
-        cls.__attrs_attrs__,
-        getattr(cls, "__attrs_post_init__", False),
-        frozen,
-        _is_slot_cls(cls),
-        cache_hash=False,
-        base_attr_map={},
-    )
-    return cls
 
 
 def fields(cls):
@@ -1376,7 +1534,7 @@ def _is_slot_attr(a_name, base_attr_map):
 
 
 def _attrs_to_init_script(
-    attrs, frozen, slots, post_init, cache_hash, base_attr_map
+    attrs, frozen, slots, post_init, cache_hash, base_attr_map, is_exc
 ):
     """
     Return a script of an initializer for *attrs* and a dict of globals.
@@ -1476,6 +1634,24 @@ def _attrs_to_init_script(
     names_for_globals = {}
     annotations = {"return": None}
 
+    if is_exc:
+        # Only the values that actually participate in the exception's
+        # positional construction end up in ``args``.  Keyword-only
+        # attributes, init=False attributes and unused factories must not
+        # leak into it, because it is used for copy and pickle support by
+        # BaseException.
+        lines.append("_exc_args = []")
+
+    def maybe_add_to_exc_args(value_var, indent=""):
+        """
+        Record *value_var* for the call to ``BaseException.__init__``.
+
+        The attributes are appended in declaration order, which is the same
+        order they appear in the generated signature.
+        """
+        if is_exc:
+            lines.append(indent + "_exc_args.append({0})".format(value_var))
+
     for a in attrs:
         if a.validator:
             attrs_to_validate.append(a)
@@ -1486,6 +1662,9 @@ def _attrs_to_init_script(
             maybe_self = "self"
         else:
             maybe_self = ""
+        # Only positional, init-enabled attributes are part of an
+        # exception's args.
+        add_to_exc_args = is_exc and a.init is True and a.kw_only is False
         if a.init is False:
             if has_factory:
                 init_factory_name = _init_factory_pat.format(a.name)
@@ -1542,6 +1721,10 @@ def _attrs_to_init_script(
                 ] = a.converter
             else:
                 lines.append(fmt_setter(attr_name, arg_name))
+            if add_to_exc_args:
+                # Use the value that has just been stored on the instance
+                # so that converted values round-trip via ``args``.
+                maybe_add_to_exc_args("self." + attr_name)
         elif has_factory:
             arg = "{arg_name}=NOTHING".format(arg_name=arg_name)
             if a.kw_only:
@@ -1556,6 +1739,8 @@ def _attrs_to_init_script(
                 lines.append(
                     "    " + fmt_setter_with_converter(attr_name, arg_name)
                 )
+                if add_to_exc_args:
+                    maybe_add_to_exc_args("self." + attr_name, indent="    ")
                 lines.append("else:")
                 lines.append(
                     "    "
@@ -1569,6 +1754,8 @@ def _attrs_to_init_script(
                 ] = a.converter
             else:
                 lines.append("    " + fmt_setter(attr_name, arg_name))
+                if add_to_exc_args:
+                    maybe_add_to_exc_args("self." + attr_name, indent="    ")
                 lines.append("else:")
                 lines.append(
                     "    "
@@ -1590,6 +1777,8 @@ def _attrs_to_init_script(
                 ] = a.converter
             else:
                 lines.append(fmt_setter(attr_name, arg_name))
+            if add_to_exc_args:
+                maybe_add_to_exc_args("self." + attr_name)
 
         if a.init is True and a.converter is None and a.type is not None:
             annotations[arg_name] = a.type
@@ -1624,6 +1813,13 @@ def _attrs_to_init_script(
         else:
             init_hash_cache = "self.%s = %s"
         lines.append(init_hash_cache % (_hash_cache_field, "None"))
+
+    if is_exc:
+        # BaseException.__init__ sets self.args which makes exceptions
+        # picklable, copyable and supplies the native __str__.  Only the
+        # values collected above are passed, so keyword-only, init=False
+        # and unused-factory attributes stay out of args.
+        lines.append("BaseException.__init__(self, *_exc_args)")
 
     args = ", ".join(args)
     if kw_only_args:

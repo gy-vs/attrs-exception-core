@@ -594,6 +594,49 @@ In Clojure that function is called `assoc <https://clojuredocs.org/clojure.core/
    False
 
 
+.. _exceptions:
+
+Exceptions
+----------
+
+If you want to use ``attrs`` to define exceptions, you can do that using the ``auto_exc=True`` argument.
+The class has to subclass :class:`BaseException` (or any subclass thereof like :class:`Exception`) and ``attrs`` will make sure it behaves like a well-behaved Python exception:
+
+.. doctest::
+
+   >>> @attr.s(auto_exc=True)
+   ... class MyError(Exception):
+   ...     x = attr.ib()
+   ...     y = attr.ib()
+
+   >>> try:
+   ...     raise MyError(1, 2)
+   ... except MyError as e:
+   ...     print(e.args, repr(e), str(e))
+   (1, 2) MyError(1, 2) (1, 2)
+
+The attributes work exactly like with regular ``attrs`` classes -- defaults, factories, keyword-only attributes, ``slots``, ``frozen`` and inheritance are all supported.
+Only the values that you actually pass positionally to the constructor end up in ``args``:
+keyword-only attributes, ``init=False`` attributes and unused factory defaults are excluded.
+That keeps ``str`` and the ``args`` tuple well-defined and the exceptions picklable and copyable, even when they have required keyword-only attributes:
+
+.. doctest::
+
+   >>> @attr.s(auto_exc=True)
+   ... class KwError(Exception):
+   ...     x = attr.ib()
+   ...     y = attr.ib(kw_only=True)
+
+   >>> e = KwError(1, y=2)
+   >>> e.args
+   (1,)
+   >>> e.y
+   2
+
+Exception instances compare and hash by object identity -- just like regular exceptions -- and ``attrs`` leaves ``__str__`` to the exception base classes.
+If you need to define your own ``__init__``, pass ``init=False``; an attribute named ``args`` is not allowed.
+
+
 Other Goodies
 -------------
 
